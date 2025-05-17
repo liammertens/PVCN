@@ -161,11 +161,9 @@ class MO_AWR(MOAgent, MOPolicy):
             gamma: float = 1,
             td_lambda: float = 0.95,
             beta: float = 0.1,
-            l2_critic = 1e-4,
             cd_threshold: float = 0.2,
             batch_size: int = 32,
             max_buffer_size: int = 1024,
-            use_is_weighting: bool = True,
             max_return: Optional[np.ndarray] = None,
             use_popf: bool = True,
             use_critic_msbe=True,
@@ -181,7 +179,6 @@ class MO_AWR(MOAgent, MOPolicy):
             learning_rate: Learning rate
             gamma: Discount factor
             td_lambda: Lambda parameter for TD update
-            weight_clip: maximum value for advantage weights
             cd_threshold: Determines min. crowding distance for using simple L2-distance
             batch_size: Maximum batch size for learning.
             max_buffer_size: Maximum size of ER buffer (= amount of trajectories)
@@ -201,14 +198,12 @@ class MO_AWR(MOAgent, MOPolicy):
         self.gamma = gamma
         self.td_lambda = td_lambda
         self.beta = beta
-        #self.weight_clip = weight_clip
         self.batch_size = batch_size
         self.max_buffer_size = max_buffer_size
         self.cd_threshold = cd_threshold
         self.use_popf = use_popf
         self.max_return = max_return
         self.use_critic_msbe = use_critic_msbe
-        self.use_is_weighting = use_is_weighting
 
         self.pf_points = [] # tuples (return, horizon)
 
@@ -221,7 +216,7 @@ class MO_AWR(MOAgent, MOPolicy):
         #th.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=0.5)
 
 
-        self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr, weight_decay=l2_critic)
+        self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr)
         self.policy_opt = th.optim.Adam(self.policy.parameters(), lr=self.policy_lr)
         if use_popf:
             self.popf = PopNet(self.reward_dim + 1 + self.observation_dim*2, self.reward_dim)
@@ -399,7 +394,6 @@ class MO_AWR(MOAgent, MOPolicy):
             loss = self.compute_value_loss(preds, returns, mean_r)
         loss.backward()
         self.val_opt.step()
-        # only use batch norm when predicting
         self.value_net.eval()
         return loss, preds
 
@@ -446,12 +440,7 @@ class MO_AWR(MOAgent, MOPolicy):
         """
         advantages = self.compute_advantages(states, returns, mean_rs, horizons)
         # We already us logsoftmax activation so log does not need to be computed here.
-        if self.use_is_weighting:
-          # weight advantages using importance sampling ratio
-          is_ratios = th.exp(preds[:, actions]) / th.FloatTensor(probs)
-          loss = -th.mean(preds[:, actions]*th.exp(is_ratios*advantages/self.beta))
-        else:
-          loss = -th.mean(preds[:, actions]*th.exp(advantages/self.beta))
+        loss = -th.mean(preds[:, actions]*th.exp(advantages/self.beta))
         return loss
     def update_policy(self, states, actions, returns, mean_r, horizons, probs):
         mean_r = th.FloatTensor(np.full((self.batch_size, self.reward_dim), mean_r)).to(self.device)
@@ -507,19 +496,41 @@ class MO_AWR(MOAgent, MOPolicy):
     def eval(self, obs, w=None):
         return self._act(obs, self.desired_return, eval_mode=True)
 
-    def evaluate_pf(self):
+    def evaluate_pf(self, num_iterations=1):
         """
-        evaluates PF points
+        evaluates PF points for a number of iterations and returns their mean returns.
+
+        Returns: tuple(return, horizon)
         """
         eval_returns = []
         for i in range(len(self.pf_points)):
             r = self.pf_points[i][0]
             h = self.pf_points[i][1]
-            transitions = self._run_episode(r, h, True)
-            for i in reversed(range(len(transitions) - 1)):
-                transitions[i].return_ += self.gamma * transitions[i + 1].return_
-            eval_returns.append(transitions[0].return_)
+            mean = [np.zeros(self.reward_dim), 0]
+            for _ in range(num_iterations):
+                transitions = self._run_episode(r, h, True)
+                for i in reversed(range(len(transitions) - 1)):
+                    transitions[i].return_ += self.gamma * transitions[i + 1].return_
+                mean[0] = mean[0] + transitions[0].return_
+                mean[1] = mean[1] + len(transitions)
+            mean[0] = mean[0] / num_iterations
+            mean[1] = mean[1] / num_iterations
+            eval_returns.append(mean)
         return eval_returns
+    
+    def prune_pf(self, eval_pf, threshold):
+        """
+        Prunes the set of PF points using their corrseponding evaluations.
+        If the difference between a point and its evaluation < threshold, keep it in the PF
+        """
+        new_pf = []
+        for i in range(len(eval_pf)):
+            diff = np.absolute(eval_pf[i][0] - self.pf_points[i][0])
+            if np.all(diff < threshold):
+                new_pf.append(self.pf_points[i])
+            else:
+                new_pf.append(eval_pf[i])
+        self.pf_points = new_pf 
 
     def save(self, savedir: str = "weights"):
         if not os.path.isdir(savedir):
@@ -545,22 +556,8 @@ class MO_AWR(MOAgent, MOPolicy):
         # sample episodes that visit state-action pair
         key = (state.tobytes(), action)
         eps_data = np.array(list(self.state_to_eps[key]), dtype=object)
+        eps_data = self.np_random.choice(eps_data, self.batch_size)
 
-        if self.prio_sampling:
-            # compute probabilities based on distance metric
-            # sample using these probs
-            state_returns = np.array([self.ep_to_transitions[e.id][e.idx].return_ for e in eps_data])
-            if state_returns.shape[0] == 1:
-                # no need to compute crowding distance
-                eps_data = self.np_random.choice(eps_data, self.batch_size)
-            else:
-
-                distances = crowding_distance(state_returns)
-                exps = np.exp(distances)
-                probs = exps / np.sum(exps)
-                eps_data = self.np_random.choice(eps_data, self.batch_size, p=probs)
-        else:
-            eps_data = self.np_random.choice(eps_data, self.batch_size)
         for e in eps_data:
             t: Transition = self.ep_to_transitions[e.id][e.idx]
             states.append(t.observation)
@@ -652,8 +649,11 @@ class MO_AWR(MOAgent, MOPolicy):
             num_value_steps = 500,
             num_popf_steps = 1000,
             num_expl_episodes = 64,
-            num_pf_points = 50,
-            prio_sampling = False,
+            num_pf_points = 25,
+            log_every = 1,
+            prune_pf_every = 5,
+            pf_prune_threshold = np.array([1,1]),
+            num_eval_iter = 1
             ):
         """
         Args:
@@ -663,6 +663,8 @@ class MO_AWR(MOAgent, MOPolicy):
             num_value_steps: Minimum number of value updates per episode
             num_popf_steps: Minimum number of popf net updates per episode
             num_pf_points: Number of PF points to keep
+            prune_pf_every: How many iterations to perform before PF pruning
+            log_every: How many iterations to perform before logging/saving
         """
         if self.log:
             self.register_additional_config(
@@ -683,11 +685,12 @@ class MO_AWR(MOAgent, MOPolicy):
         self.num_popf_steps = num_popf_steps
         self.num_policy_steps = num_policy_steps
         self.num_pf_points = num_pf_points
-        self.prio_sampling = prio_sampling
         n_checkpoints = 0
-
+        evals = 0
+        iteration = 0
         self.experience_replay = []
         total_episodes = num_er_episodes
+
         for _ in range(num_er_episodes):
             transitions = []
             obs,_ = self.env.reset()
@@ -701,8 +704,9 @@ class MO_AWR(MOAgent, MOPolicy):
                 self.global_step += 1
             self._add_episode(transitions, max_size=self.max_buffer_size, step=self.global_step, fill_buffer=True)
 
-        val_losses = []
+        
         while self.global_step < total_timesteps:
+            iteration += 1
             val_losses, popf_losses, policy_losses = self.update()
 
             np.set_printoptions(precision=3)
@@ -718,6 +722,13 @@ class MO_AWR(MOAgent, MOPolicy):
             # update replay buffer with correct distances
             self._update_er_distances(self.cd_threshold)
 
+            # prune non-achievable returns from PF
+            if iteration >= (evals + 1) * prune_pf_every:
+                evals += 1
+                print("Pruning PF")
+                eval_returns = self.evaluate_pf(num_eval_iter)
+                self.prune_pf(eval_returns, pf_prune_threshold)
+            
             if not self.use_popf:
                 popf_losses = [0]
 
@@ -745,19 +756,15 @@ class MO_AWR(MOAgent, MOPolicy):
                             "global_step": self.global_step,
                         },
                     )
-            if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
+            
+            if iteration >= (n_checkpoints + 1) * log_every:
                 self.save()
                 n_checkpoints += 1
                 er_returns = [r[2][0].return_ for r in self.experience_replay]
-                eval_returns = self.evaluate_pf()
-                failed_evals = 0
-                for r in eval_returns:
-                    if np.array_equal(r, np.float32([0, -100])):
-                        failed_evals += 1
-                print('Truncated eval episodes: ', failed_evals)
+                eval_returns = self.evaluate_pf(num_eval_iter)
                 x1, y1 = zip(*er_returns)
                 x2, y2 = zip(*[p[0] for p in self.pf_points])
-                x3, y3 = zip(*eval_returns)
+                x3, y3 = zip(*[p[0] for p in eval_returns])
                 plt.figure(figsize=(8, 6))
                 plt.scatter(x1, y1, color='blue', label='buffer returns')
                 plt.scatter(x2, y2, color='red', label='current pf')
@@ -778,3 +785,5 @@ class MO_AWR(MOAgent, MOPolicy):
                     os.makedirs(results_dir)
                 plt.savefig(results_dir + f)
                 plt.close()
+
+                
