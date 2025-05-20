@@ -31,7 +31,6 @@ class Transition:
     value_vec: np.ndarray
     horizon: int
     next_observation: np.ndarray
-    action_prob: float
     terminal: bool
 
 class EpisodeStateData:
@@ -212,10 +211,6 @@ class MO_AWR(MOAgent, MOPolicy):
         self.value_net = ValueNet(self.observation_dim, self.reward_dim)
         self.policy = PolicyNet(self.observation_dim, self.reward_dim, self.action_dim)
 
-        #th.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-        #th.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=0.5)
-
-
         self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr)
         self.policy_opt = th.optim.Adam(self.policy.parameters(), lr=self.policy_lr)
         if use_popf:
@@ -378,38 +373,44 @@ class MO_AWR(MOAgent, MOPolicy):
         errors = th.linalg.vector_norm(preds - targets, dim=1)**2
         return th.mean(errors*weights)
 
-    def update_value_function(self, states, mean_r, returns, horizons):
-        mean_r = th.FloatTensor(np.full((self.batch_size, self.reward_dim), mean_r)).to(self.device)
+    def update_value_function(self, states, mean_rs, returns, horizons):
+        mean_rs = th.FloatTensor(np.array(mean_rs)).to(self.device)
         states = th.FloatTensor(np.array(states)).to(self.device)
         returns = th.FloatTensor(np.array(returns))
         horizons = th.FloatTensor(np.array(horizons)).unsqueeze(1).to(self.device)
 
         self.value_net.train()
         self.val_opt.zero_grad()
-        preds = self.value_net(states, mean_r, horizons)
+        preds = self.value_net(states, mean_rs, horizons)
 
         if self.use_critic_msbe:
             loss = F.mse_loss(preds, returns)
         else:
-            loss = self.compute_value_loss(preds, returns, mean_r)
+            loss = self.compute_value_loss(preds, returns, mean_rs)
         loss.backward()
         self.val_opt.step()
         self.value_net.eval()
         return loss, preds
 
-    def update_popf(self, N, states, actions, next_states, next_R):
+    def update_popf(self, N, states, actions, next_states, next_Rs):
         states = th.FloatTensor(np.array(states))
         actions = th.unsqueeze(th.tensor(actions), 1)
         next_states = th.FloatTensor(np.array(next_states))
         N = th.tensor(np.float32(N))
         x = th.cat((N, states, actions, next_states), dim=1).float().to(self.device)
-        targets = th.tensor(np.full((self.batch_size, self.reward_dim), next_R)).float()
+        targets = th.tensor(np.array(next_Rs)).float()
+        self.popf.train()
         self.popf_opt.zero_grad()
 
         preds = self.popf(x)
+        # weight based on mismatch between next_Rs (batch mean desired returns) and N (prev val. vector - reward)
+        #weights = 1/(th.linalg.vector_norm(N - targets, dim=1) + 1)**2
+        #errors = th.linalg.vector_norm(preds - targets, dim=1)**2
+        #loss = th.mean(weights*errors)
         loss = F.mse_loss(preds, targets)
         loss.backward()
         self.popf_opt.step()
+        self.popf.eval()
         return loss, preds
 
     def _dominates(self, a, b):
@@ -434,22 +435,22 @@ class MO_AWR(MOAgent, MOPolicy):
         # normalize weights
         weights = (weights - weights.mean()) / (weights.std() + 1e-8)
         return th.tensor(weights)
-    def compute_policy_loss(self, preds, actions, states, returns, mean_rs, horizons, probs):
+    def compute_policy_loss(self, preds, actions, states, returns, mean_rs, horizons):
         """
-        Loss is computed using advantage estimates. Each loss is also weighted using importance sampling ratios
+        Loss is computed using advantage estimates
         """
         advantages = self.compute_advantages(states, returns, mean_rs, horizons)
         # We already us logsoftmax activation so log does not need to be computed here.
         loss = -th.mean(preds[:, actions]*th.exp(advantages/self.beta))
         return loss
-    def update_policy(self, states, actions, returns, mean_r, horizons, probs):
-        mean_r = th.FloatTensor(np.full((self.batch_size, self.reward_dim), mean_r)).to(self.device)
+    def update_policy(self, states, actions, returns, mean_r, horizons):
+        mean_r = th.FloatTensor(np.array(mean_r)).to(self.device)
         states = th.FloatTensor(np.array(states)).to(self.device)
         horizons = th.FloatTensor(np.array(horizons)).unsqueeze(1).to(self.device)
 
         self.policy_opt.zero_grad()
         preds = self.policy(states, mean_r, horizons)
-        loss = self.compute_policy_loss(preds, actions, states, returns, mean_r, horizons, probs)
+        loss = self.compute_policy_loss(preds, actions, states, returns, mean_r, horizons)
         loss.backward()
         self.policy_opt.step()
         return loss, preds
@@ -466,7 +467,7 @@ class MO_AWR(MOAgent, MOPolicy):
             action = np.argmax(log_probs)
         else:
             action = self.np_random.choice(np.arange(len(log_probs)), p=np.exp(log_probs)) # exponentiate to get proper prob.
-        return action, np.exp(log_probs[action])
+        return action
 
     def _run_episode(self, desired_return, desired_horizon, eval_mode=False):
         transitions = []
@@ -474,18 +475,18 @@ class MO_AWR(MOAgent, MOPolicy):
         done = False
         N = desired_return
         while not done:
-            action, prob = self._act(obs, desired_return, desired_horizon, eval_mode)
+            action = self._act(obs, desired_return, desired_horizon, eval_mode)
             n_obs, reward, terminated, truncated, _ = self.env.step(action)
             done = terminated or truncated
 
-            transitions.append(Transition(obs, action, np.float32(reward).copy(), np.float32(reward).copy(), desired_return, 1, n_obs, prob, terminated))
+            transitions.append(Transition(obs, action, np.float32(reward).copy(), np.float32(reward).copy(), desired_return, 1, n_obs, terminated))
 
             if self.use_popf:
                 N = (N-reward)/self.gamma
                 x = np.concatenate((N, obs, [action], n_obs))
                 desired_return = self.popf(
                     th.tensor(x).float().to(self.device)
-                )
+                ).detach().numpy()
             else:
                 desired_return = np.clip(desired_return - reward, -np.inf, self.max_return, dtype=np.float32)
 
@@ -528,8 +529,6 @@ class MO_AWR(MOAgent, MOPolicy):
             diff = np.absolute(eval_pf[i][0] - self.pf_points[i][0])
             if np.all(diff < threshold):
                 new_pf.append(self.pf_points[i])
-            else:
-                new_pf.append(eval_pf[i])
         self.pf_points = new_pf 
 
     def save(self, savedir: str = "weights"):
@@ -539,36 +538,79 @@ class MO_AWR(MOAgent, MOPolicy):
         th.save(self.value_net, f"{savedir}/policy.pt")
         if self.use_popf:
             th.save(self.value_net, f"{savedir}/popf.pt")
-
-    def get_batch(self, state, action):
+    
+    def get_batched_trajectory(self):
         """
-        Get batch of (s, a, r, s', R, R^, H)
-        s and a are the same per batch
+        Get batched trajectory of (s, a, r, s', R, R^, H)
+        s and a are the same for each computation of R^:
+            several s,a pairs are used within each batch to maintain i.i.d. samples
         """
         states = []
         actions = []
         rewards = []
         next_states = []
         returns = []
-        mean_R = np.zeros(self.reward_dim)
+        mean_Rs = []
         horizons = []
-        probs = []
-        # sample episodes that visit state-action pair
-        key = (state.tobytes(), action)
-        eps_data = np.array(list(self.state_to_eps[key]), dtype=object)
-        eps_data = self.np_random.choice(eps_data, self.batch_size)
+        pf_candidates = []
 
-        for e in eps_data:
-            t: Transition = self.ep_to_transitions[e.id][e.idx]
-            states.append(t.observation)
-            actions.append(t.action)
-            rewards.append(np.float32(t.reward))
-            next_states.append(t.next_observation)
-            returns.append(np.float32(t.return_))
-            mean_R += np.float32(t.return_)
-            horizons.append(np.float32(t.horizon))
-            probs.append(np.float32(t.action_prob))
-        return states, actions, rewards, next_states, returns, mean_R/self.batch_size, horizons, probs
+        ep_id = random.choice(list(self.ep_to_transitions.keys()))
+        trajectory = self.ep_to_transitions[ep_id]
+        # iterate over each transition
+        is_init_state = True
+        for t in trajectory:
+            batch_states = []
+            batch_actions = []
+            batch_rewards = []
+            batch_next_states = []
+            batch_returns = []
+            batch_mean_Rs = []
+            batch_horizons = []
+            mean_h = 0.0 # keep track of mean horizon per s,a pair
+            mean_R = np.zeros(self.reward_dim)
+            # make a batch of similar transitions (same s and a)
+            s = t.observation
+            a = t.action
+            batch_states.append(s)
+            batch_actions.append(a)
+            batch_rewards.append(np.float32(t.reward))
+            batch_next_states.append(t.next_observation)
+            batch_returns.append(np.float32(t.return_))
+            mean_R += np.float32(t.return_)/self.batch_size
+            batch_horizons.append(np.float32(t.horizon))
+            mean_h += t.horizon / self.batch_size
+
+            key = (s.tobytes(), a)
+            other_eps_data = np.array(list(self.state_to_eps[key]), dtype=object)
+            other_eps_data = self.np_random.choice(other_eps_data, self.batch_size-1)
+
+            for e in other_eps_data:
+                t_: Transition = self.ep_to_transitions[e.id][e.idx]
+                batch_states.append(t_.observation)
+                batch_actions.append(t_.action)
+                batch_rewards.append(np.float32(t_.reward))
+                batch_next_states.append(t_.next_observation)
+                batch_returns.append(np.float32(t_.return_))
+                mean_R += np.float32(t_.return_)/self.batch_size
+                batch_horizons.append(np.float32(t_.horizon))
+                mean_h += t_.horizon / self.batch_size
+
+            if is_init_state:
+                pf_candidates.append((mean_R, mean_h))
+                is_init_state = False
+            for _ in range(self.batch_size):
+                batch_mean_Rs.append(mean_R)
+            states.append(batch_states)
+            actions.append(batch_actions)
+            rewards.append(batch_rewards)
+            next_states.append(batch_next_states)
+            returns.append(batch_returns)
+            mean_Rs.append(batch_mean_Rs)
+            horizons.append(batch_horizons)
+
+        return states, actions, rewards, next_states, returns, mean_Rs, horizons, pf_candidates
+
+    
 
     def update(self):
         states = [] # shape = (batch_size, obs_dim)
@@ -578,19 +620,14 @@ class MO_AWR(MOAgent, MOPolicy):
         returns = []
         mean_Rs = []
         horizons = []
-        probs = []
 
         pf_candidates = []
 
         max_steps = max(self.num_policy_steps, self.num_value_steps, self.num_popf_steps)
         current_steps = 0
-        init_state, _ = self.env.reset()
         while current_steps < max_steps:
-            # pick random state-action pair from er
-            # cannot use np_random here because it does not support bytes
-            k = random.choice(list(self.state_to_eps.keys()))
-            state = np.frombuffer(k[0], dtype=np.int32).reshape(self.observation_shape)
-            s, a, r, s_, R, mean_R, h, p = self.get_batch(state, k[1])
+            s, a, r, s_, R, mean_R, h, p = self.get_batched_trajectory()
+
             states.append(s)
             actions.append(a)
             rewards.append(r)
@@ -598,46 +635,56 @@ class MO_AWR(MOAgent, MOPolicy):
             returns.append(R)
             mean_Rs.append(mean_R)
             horizons.append(h)
-            probs.append(p)
-            current_steps += 1
-            if np.array_equal(init_state, state):
-                pf_candidates.append((mean_R, np.mean(h)))
+            current_steps += len(s)
+            for candidate in p:
+                pf_candidates.append(candidate)
         if len(pf_candidates) > 0:
             self._add_to_pf(pf_candidates)
 
         print('training value net')
         val_losses = []
-        for i in range(self.num_value_steps):
-            s, R, mean_R, h = states[i], returns[i], mean_Rs[i], horizons[i]
-            val_loss, _ = self.update_value_function(s, mean_R, R, h)
-            val_losses.append(val_loss.detach().cpu().numpy())
-        self.global_step += self.num_value_steps
+
+        val_steps = 0
+        while val_steps < self.num_value_steps:
+            #iterate over batched trajectories
+            for e in range(len(states)):
+                # iterate over single trajectory
+                for i in range(len(states[e])):
+                    s, R, mean_R, h = states[e][i], returns[e][i], mean_Rs[e][i], horizons[e][i]
+                    val_loss, _ = self.update_value_function(s, mean_R, R, h)
+                    val_losses.append(val_loss.detach().cpu().numpy())
+                val_steps += len(states[e])
+        self.global_step += val_steps
 
         popf_losses = []
         if self.use_popf:
-            popf_steps = 0
             print('training POPF net')
-            for e in range(len(states)):
-                prev = mean_Rs[e][0]
-                for i in range(len(states[e])):
-                    s, a, r, s_, next_R = states[e][i], actions[e][i], rewards[e][i], next_states[e][i], mean_Rs[e][i]
-                    N = (prev - r) / self.gamma
-                    popf_loss, _ = self.update_popf(N, s, a, s_, next_R)
-                    popf_losses.append(popf_loss.detach().cpu().numpy())
-                    prev = next_R
+            popf_steps = 0
+            while popf_steps < self.num_popf_steps:
+                for e in range(len(states)):
+                    prev = mean_Rs[e][0]
+                    for i in range(len(states[e])):
+                        s, a, r, s_, next_R = states[e][i], actions[e][i], rewards[e][i], next_states[e][i], mean_Rs[e][i]
+                        N = (np.array(prev) - np.array(r)) / self.gamma
+                        popf_loss, _ = self.update_popf(N, s, a, s_, next_R)
+                        popf_losses.append(popf_loss.detach().cpu().numpy())
+                        prev = next_R
                     popf_steps += len(states[e])
-                if popf_steps > self.num_popf_steps:
-                    break;
+
             self.global_step += popf_steps
 
         policy_losses = []
         print('training policy')
-        for i in range(self.num_policy_steps):
-            prev = mean_Rs[0]
-            s, a, R, mean_R, h, p = states[i], actions[i], returns[i], mean_Rs[i], horizons[i], probs[i]
-            policy_loss, _ = self.update_policy(s, a, R, mean_R, h, p)
-            policy_losses.append(policy_loss.detach().cpu().numpy())
-        self.global_step += self.num_policy_steps
+
+        policy_steps = 0
+        while policy_steps < self.num_policy_steps:
+            for e in range(len(states)):
+                for i in range(len(states[e])):
+                    s, a, R, mean_R, h = states[e][i], actions[e][i], returns[e][i], mean_Rs[e][i], horizons[e][i]
+                    policy_loss, _ = self.update_policy(s, a, R, mean_R, h)
+                    policy_losses.append(policy_loss.detach().cpu().numpy())
+                policy_steps += len(states[e])
+        self.global_step += policy_steps
 
         return val_losses, popf_losses, policy_losses
 
@@ -651,7 +698,7 @@ class MO_AWR(MOAgent, MOPolicy):
             num_expl_episodes = 64,
             num_pf_points = 25,
             log_every = 1,
-            prune_pf_every = 5,
+            prune_pf_every = 25,
             pf_prune_threshold = np.array([1,1]),
             num_eval_iter = 1
             ):
@@ -698,7 +745,7 @@ class MO_AWR(MOAgent, MOPolicy):
             while not done:
                 action = self.env.action_space.sample()
                 n_obs, reward, terminated, truncated, _ = self.env.step(action)
-                transitions.append(Transition(obs, action, np.float32(reward).copy(), np.float32(reward).copy(), np.zeros(self.reward_dim), 1, n_obs, 1/self.action_dim, terminated))
+                transitions.append(Transition(obs, action, np.float32(reward).copy(), np.float32(reward).copy(), np.zeros(self.reward_dim), 1, n_obs, terminated))
                 done = terminated or truncated
                 obs = n_obs
                 self.global_step += 1
