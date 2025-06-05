@@ -117,7 +117,7 @@ class PolicyNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
-            nn.LogSoftmax(dim=1)
+            nn.Softmax(dim=1)
         )
     def forward(self, state, desired_return, horizon):
         s = self.state_emb(state.float())
@@ -130,26 +130,16 @@ class PopNet(nn.Module):
     """
     POP following MLP.
     Returns the correct desired value vector for a policy that is being followed.
-    It is part of the actor as it the suggested desired value vector is used by it.
+    It is part of the actor as the suggested desired value vector is used by it.
     Code from: https://github.com/rradules/POP-following
     """
 
-    def __init__(self, d_in, d_out, dropout=0.5):
+    def __init__(self, d_in, d_out):
         super(PopNet, self).__init__()
         self.layers = nn.Sequential(
-            nn.Linear(d_in, 100),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(100, d_out),
+            nn.Linear(d_in, 64),
+            nn.Tanh(),
+            nn.Linear(64, d_out),
         )
     def forward(self, x):
         return self.layers(x)
@@ -163,12 +153,13 @@ class MO_AWR(MOAgent, MOPolicy):
             popf_lr: float = 1e-4,
             gamma: float = 1,
             td_lambda: float = 0.95,
-            beta: float = 1,
+            beta = 1,
+            alpha = .01,
             batch_size: int = 4,
             max_buffer_size: int = 1024,
-            max_return: Optional[np.ndarray] = None,
             use_popf: bool = True,
             use_is_weighting=True,
+            min_exploration_stdev = 0,
             device: Union[th.device, str] = "auto",
             log: bool = False,
             wandb_entity: Optional[str] = None,
@@ -184,6 +175,9 @@ class MO_AWR(MOAgent, MOPolicy):
             cd_threshold: Determines min. crowding distance for using simple L2-distance
             batch_size: Maximum batch size for learning.
             max_buffer_size: Maximum size of ER buffer (= amount of trajectories)
+            us_popf: Whether to use POPF network
+            use_is_weighting: Whether to use importance sampling ratio for weighting advantages
+            min_explorations_stdev: stdev to use when only a single return is in the PF.
         """
         MOAgent.__init__(self, env, device=device, seed=seed)
         MOPolicy.__init__(self, device)
@@ -197,12 +191,13 @@ class MO_AWR(MOAgent, MOPolicy):
         self.popf_lr = popf_lr
         self.gamma = gamma
         self.td_lambda = td_lambda
-        self.beta = beta
         self.batch_size = batch_size
         self.max_buffer_size = max_buffer_size
         self.use_popf = use_popf
-        self.max_return = max_return
         self.use_is_weighting = use_is_weighting
+        self.min_expl_stdev = min_exploration_stdev
+        self.beta = beta
+        self.alpha = alpha
 
         self.pf_points = [] # tuples (return, horizon)
 
@@ -212,10 +207,13 @@ class MO_AWR(MOAgent, MOPolicy):
         self.policy = PolicyNet(self.observation_dim, self.reward_dim, self.action_dim)
 
         self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr)
+        self.val_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.val_opt, 50000, 1e-5)
         self.policy_opt = th.optim.Adam(self.policy.parameters(), lr=self.policy_lr)
+        self.policy_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.policy_opt, 50000, 1e-5)
         if use_popf:
             self.popf = PopNet(self.reward_dim + 1 + self.observation_dim*2, self.reward_dim)
             self.popf_opt = th.optim.Adam(self.popf.parameters(), lr=self.popf_lr)
+            self.popf_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.popf_opt, 50000, 1e-5)
 
         self.log = log
         if log:
@@ -230,7 +228,6 @@ class MO_AWR(MOAgent, MOPolicy):
             "policy_lr": self.policy_lr,
             "popf_lr": self.popf_lr,
             "TD_lambda": self.td_lambda,
-            "beta": self.beta,
             "buffer_size": self.max_buffer_size,
             "use_popf": self.use_popf,
             "seed": self.seed,
@@ -248,7 +245,7 @@ class MO_AWR(MOAgent, MOPolicy):
                 transitions[i].return_ = transitions[i].reward + self.gamma * ((1-self.td_lambda) *
                                                                                self.value_net(th.FloatTensor(transitions[i].observation).unsqueeze(0).to(self.device),
                                                                                               th.FloatTensor(transitions[i].observed_return).unsqueeze(0).to(self.device),
-                                                                                              th.FloatTensor([transitions[i].horizon]).unsqueeze(0).to(self.device)).detach().numpy()[0] +
+                                                                                              th.FloatTensor((np.array(transitions[i].horizon) - 1).reshape(1,1)).to(self.device)).detach().numpy()[0] +
                                                                                self.td_lambda*transitions[i + 1].return_)
             else:
                 transitions[i].return_ += self.gamma * transitions[i + 1].return_
@@ -257,10 +254,7 @@ class MO_AWR(MOAgent, MOPolicy):
                 state = transitions[i+1].observation.tobytes()
             elif isinstance(self.env.observation_space, spaces.Discrete):
                 state = transitions[i+1].observation
-            if isinstance(self.env.action_space, spaces.Box):
-                action = transitions[i+1].action.tobytes()
-            elif isinstance(self.env.action_space, spaces.Discrete):
-                action = transitions[i+1].action
+            action = transitions[i+1].action
             # add episode id (= step) and index of this transition to the dict
             ep_data = EpisodeStateData(step, i+1)
             key = (state, action)
@@ -274,10 +268,7 @@ class MO_AWR(MOAgent, MOPolicy):
         elif isinstance(self.env.observation_space, spaces.Discrete):
             state = transitions[0].observation
         # NOTE: currently only discrete actions are supported...
-        if isinstance(self.env.action_space, spaces.Box):
-            action = transitions[0].action.tobytes()
-        elif isinstance(self.env.action_space, spaces.Discrete):
-            action = transitions[0].action
+        action = transitions[0].action
         self.state_to_eps[(state, action)].add(EpisodeStateData(step, 0))
         # Add transitions to dict
         self.ep_to_transitions[step] = transitions
@@ -294,11 +285,8 @@ class MO_AWR(MOAgent, MOPolicy):
                 if isinstance(self.env.observation_space, spaces.Box):
                     s = t.observation.tobytes()
                 elif isinstance(self.env.observation_space, spaces.Discrete):
-                    s = t.observation           
-                if isinstance(self.env.action_space, spaces.Box):
-                    a = t.action.tobytes()
-                elif isinstance(self.env.action_space, spaces.Discrete):
-                    a = t.action
+                    s = t.observation
+                a = t.action
                 key = (s, a)
                 if not key in keys_to_skip:
                     self.state_to_eps[key].remove(old_data)
@@ -349,7 +337,7 @@ class MO_AWR(MOAgent, MOPolicy):
         """
         for r in returns:
             self.pf_points.append(r)
-        nd_inds = get_non_dominated_inds(np.float32([ret[0] for ret in self.pf_points]))
+        nd_inds = get_non_dominated_inds(np.array([ret[0] for ret in self.pf_points]))
         # Only keep ND points
         self.pf_points = np.array(self.pf_points, dtype=object)[nd_inds]
         # avoid unncessary computations + shape mismatch when computing CD for single point
@@ -362,29 +350,26 @@ class MO_AWR(MOAgent, MOPolicy):
         else:
           self.pf_points = self.pf_points.tolist()
 
-    def _choose_commands(self, num_returns):
+    def _choose_commands(self):
         """
-        Pick a desired return from the PF and increase it in one objective:
-            - num_returns determines the amount of returns considered for computation of the stdev
-            - If num_returns < size of PF, compute stdev over whole PF
+        Pick a desired return from the PF and increase it in one objective based on the mean/stdev of the PF returns.
+        If only a single return is present, use a user-defined stdev
         """
         # pick random objective
         r_i = self.np_random.integers(0, self.reward_dim)
         # pick random returns
-        if num_returns < len(self.pf_points):
-            returns_i = self.np_random.choice(np.arange(len(self.pf_points)), num_returns)
-            pf_points = self.pf_points[returns_i]
-            stdev = np.std(np.array([p[0] for p in pf_points]), axis=0)[r_i] # compute stdev for objective r_i
-            desired_return = self.np_random.choice(pf_points)
-        else:
-            ret_idx = self.np_random.integers(0, len(self.pf_points))
-            stdev = np.std(np.array([p[0] for p in self.pf_points]), axis=0)[r_i]
-            desired_return = np.array(self.pf_points[ret_idx], dtype=object)
+        ret_idx = self.np_random.integers(0, len(self.pf_points))
+        stdev = np.std(np.array([p[0] for p in self.pf_points]), axis=0)[r_i]
+        desired_return = np.array(self.pf_points[ret_idx], dtype=object)
         # make a deep copy as we are working with np array of objects!
         c = copy.deepcopy(desired_return)
+        # ensure some exploration is still done when only one sample is in PF
+        if self.min_expl_stdev != 0 and stdev < self.min_expl_stdev:
+            stdev = self.min_expl_stdev
         c[0][r_i] += self.np_random.uniform(0, stdev)
         desired_horizon = c[1]
         # decrease horizon in attempt to improve
+        # do not limit to be positive so that model learns this
         desired_horizon -= 2
 
         return np.float32(c[0]), np.float32(desired_horizon)
@@ -401,22 +386,23 @@ class MO_AWR(MOAgent, MOPolicy):
         errors = th.sum((preds - mean_rs)**2, dim=1)
         return th.mean(errors*weights)
 
-    def update_value_function(self, states, mean_rs, returns, horizons):
-        mean_rs = th.FloatTensor(np.array(mean_rs))
+    def update_value_function(self, states, mean_rs, returns, rewards, horizons):
+        mean_rs = np.array(mean_rs)
         states = th.FloatTensor(np.array(states)).to(self.device)
-        returns = th.FloatTensor(np.array(returns)).to(self.device)
+        returns = np.array(returns)
         horizons = th.FloatTensor(np.array(horizons)).unsqueeze(1).to(self.device)
 
         self.value_net.train()
         self.val_opt.zero_grad()
-        preds = self.value_net(states, returns, horizons)
+        preds = self.value_net(states, th.FloatTensor(returns).to(self.device), horizons)
 
-        """if self.use_critic_msbe:
-            loss = F.mse_loss(preds, returns)
-        else:"""
-        loss = self.compute_value_loss(preds, returns, mean_rs)
+        # subtract observed reward and add mean reward
+        targets =  th.FloatTensor(returns - np.array(rewards) + mean_rs)
+        #loss = self.compute_value_loss(preds, returns, mean_rs)
+        loss = F.mse_loss(preds, targets)
         loss.backward()
         self.val_opt.step()
+        self.val_sched.step()
         self.value_net.eval()
         return loss, preds
 
@@ -434,12 +420,13 @@ class MO_AWR(MOAgent, MOPolicy):
         loss = F.mse_loss(preds, targets)
         loss.backward()
         self.popf_opt.step()
+        self.popf_sched.step()
         self.popf.eval()
         return loss, preds
 
     def _dominates(self, a, b):
         return np.all(a >= b) and np.any(a > b)
-    def compute_advantages(self, returns, V_s, is_ratios):
+    def compute_advantages(self, returns, V_s):
         """
         Computed advantage weights for policy loss:
             - If the return dominates the desired return, use L2-norm
@@ -450,9 +437,9 @@ class MO_AWR(MOAgent, MOPolicy):
         res = [(i, self._dominates(R, V)) for i, (R, V) in enumerate(pairs)]
         for i, dominates in res:
             if dominates:
-                A = np.linalg.norm(is_ratios[i]*(returns[i]-V_s[i]))
+                A = np.linalg.norm(returns[i]-V_s[i])
             else:
-                A = -np.linalg.norm(is_ratios[i]*(returns[i]-V_s[i]))
+                A = -np.linalg.norm(returns[i]-V_s[i])
             weights.append(A)
         weights = np.array(weights)
         # normalize weights
@@ -460,25 +447,27 @@ class MO_AWR(MOAgent, MOPolicy):
         return th.tensor(weights)
     def compute_policy_loss(self, preds, actions, returns, expected_returns, probs):
         """
-        Loss is computed using advantage estimates. Advantage weights are weighted by IS ratio
+        Loss is computed using advantage estimates. Advantage weights are weighted by IS ratio.
+        An entropy term is added to ensure exploration
         """
         if self.use_is_weighting:
-          is_ratios = (th.exp(preds[th.arange(self.batch_size), actions]) / th.FloatTensor(np.array(probs))).detach().numpy()
+          is_ratios = (preds[th.arange(self.batch_size), actions] / th.FloatTensor(np.array(probs))).detach()
         else:
-          is_ratios = np.ones(self.batch_size)
-        advantages = self.compute_advantages(returns, expected_returns, is_ratios)
-        # We already us logsoftmax activation so log does not need to be computed here.
-        loss = -th.mean(preds[th.arange(self.batch_size), actions]*th.exp(advantages/self.beta))
+          is_ratios = th.ones(self.batch_size)
+        advantages = self.compute_advantages(returns, expected_returns)
+        entropy = -th.sum(preds * th.log(preds + 1e-8), dim=1).mean()
+        loss = -th.mean(th.log(preds[th.arange(self.batch_size), actions] + 1e-8)*is_ratios*th.exp(advantages/self.beta)) - self.alpha*entropy
         return loss
     def update_policy(self, states, actions, returns, horizons, expected_returns, probs):
         states = th.FloatTensor(np.array(states)).to(self.device)
         horizons = th.FloatTensor(np.array(horizons)).unsqueeze(1).to(self.device)
 
         self.policy_opt.zero_grad()
-        preds = self.policy(states, th.FloatTensor(expected_returns), horizons)
+        preds = self.policy(states, th.FloatTensor(expected_returns).to(self.device), horizons)
         loss = self.compute_policy_loss(preds, actions, returns, expected_returns, probs)
         loss.backward()
         self.policy_opt.step()
+        self.policy_sched.step()
         return loss, preds
 
     def _act(self, state, desired_return, desired_horizon, eval_mode=False):
@@ -487,13 +476,13 @@ class MO_AWR(MOAgent, MOPolicy):
             th.unsqueeze(th.FloatTensor(desired_return), 0).to(self.device),
             th.unsqueeze(th.FloatTensor([desired_horizon]), 0).to(self.device),
         )
-        log_probs = pred.detach().cpu().numpy()[0]
+        probs = pred.detach().cpu().numpy()[0]
 
         if eval_mode:
-            action = np.argmax(log_probs)
+            action = np.argmax(probs)
         else:
-            action = self.np_random.choice(np.arange(len(log_probs)), p=np.exp(log_probs)) # exponentiate to get proper prob.
-        return action, np.exp(log_probs[action])
+            action = self.np_random.choice(np.arange(len(probs)), p=probs) # exponentiate to get proper prob.
+        return action, probs[action]
 
     def _run_episode(self, desired_return, desired_horizon, eval_mode=False):
         transitions = []
@@ -516,7 +505,7 @@ class MO_AWR(MOAgent, MOPolicy):
                 obs = n_obs
             else:
                 obs = n_obs
-                desired_return = np.clip((desired_return - reward) / self.gamma, -np.inf, self.max_return, dtype=np.float32)    
+                desired_return = (desired_return - reward) / self.gamma   
         return transitions
 
     def eval(self, obs, w=None):
@@ -548,17 +537,28 @@ class MO_AWR(MOAgent, MOPolicy):
         """
         Prunes the set of PF points using their corrseponding evaluations.
         If the difference between a point and its evaluation < threshold, keep it in the PF.
-        If the evaluation is pareto dominant, keep that pareto dominant point
+        If multiple points result in the same evaluation, keep the one that resembles the evaluation most
+
+        returns: evaluations of kept pf points
         """
         new_pf = []
+        evaluations = []
+        diffs = []
         for i in range(len(eval_pf)):
             diff = np.absolute(eval_pf[i][0] - self.pf_points[i][0])
-            if self._dominates(eval_pf[i][0], self.pf_points[i][0]):
-                new_pf.append(eval_pf[i])
-            elif np.all(diff < threshold):
+            if np.all(diff < threshold):
                 new_pf.append(self.pf_points[i])
-            
-        self.pf_points = new_pf 
+                evaluations.append(eval_pf[i])
+                diffs.append(np.linalg.norm(diff, ord=1))
+                
+        unique_dict = {}
+        for i in range(len(evaluations)):
+            if i not in unique_dict or diff[i] < unique_dict[i][0]:
+                unique_dict[i] = (new_pf[i], evaluations[i])
+        new_pf = [p[0] for p in unique_dict.values()]
+        evaluations = [p[1] for p in unique_dict.values()]
+        self.pf_points = new_pf
+        return evaluations
 
     def save(self, checkpoint, savedir: str = "weights"):
         if not os.path.isdir(savedir):
@@ -568,11 +568,10 @@ class MO_AWR(MOAgent, MOPolicy):
         if self.use_popf:
             th.save(self.value_net, f"{savedir}/popf_{checkpoint}.pt")
     
-    def get_batched_trajectory(self):
+    def get_batch(self):
         """
-        Get batched trajectory of (s, a, r, s', R, R^, H)
-        s and a are the same for each computation of R^:
-            several s,a pairs are used within each batch to maintain i.i.d. samples
+        Get a batch of (s, a, r, s', R, r^, H)
+        s and a are the same for each computation of r^:
         """
         states = []
         actions = []
@@ -582,66 +581,34 @@ class MO_AWR(MOAgent, MOPolicy):
         mean_Rs = []
         horizons = []
         probs = []
+        mc_returns = []
+        is_init = [] # indicates whether state was initial
+        mean_R = 0
 
-        ep_id = random.choice(list(self.ep_to_transitions.keys()))
-        trajectory = self.ep_to_transitions[ep_id]
-        # iterate over each transition
-        for t in trajectory:
-            batch_states = []
-            batch_actions = []
-            batch_rewards = []
-            batch_next_states = []
-            batch_returns = []
-            batch_mean_Rs = []
-            batch_horizons = []
-            batch_probs = []
-            mean_h = 0.0 # keep track of mean horizon per s,a pair
-            mean_R = np.zeros(self.reward_dim)
-            # make a batch of similar transitions (same s and a)
-            s = t.observation
-            a = t.action
-            batch_states.append(s)
-            batch_actions.append(a)
-            batch_rewards.append(np.float32(t.reward))
-            batch_next_states.append(t.next_observation)
-            batch_returns.append(np.float32(t.observed_return))
-            mean_R += np.float32(t.return_)/self.batch_size
-            batch_horizons.append(np.float32(t.horizon))
-            batch_probs.append(t.prob)
-            mean_h += t.horizon / self.batch_size
+        key = random.choice(list(self.state_to_eps.keys()))
+        eps_data = np.array(list(self.state_to_eps[key]), dtype=object)
+        eps_data = self.np_random.choice(eps_data, self.batch_size)
+        for e in eps_data:
+            t: Transition = self.ep_to_transitions[e.id][e.idx]
+            states.append(t.observation)
+            actions.append(t.action)
+            rewards.append(np.float32(t.reward))
+            next_states.append(t.next_observation)
+            returns.append(np.float32(t.return_))
+            mc_returns.append(np.float32(t.observed_return))
+            mean_R += np.float32(t.reward)
+            horizons.append(np.float32(t.horizon))
+            probs.append(np.float32(t.prob))
+            if e.idx == 0:
+                is_init.append(1)
+            else:
+                is_init.append(0)
 
-            if isinstance(self.env.observation_space, spaces.Box):
-                s = s.tobytes()
-            if isinstance(self.env.action_space, spaces.Box):
-                a = a.tobytes()
-            key = (s,a)
-            other_eps_data = np.array(list(self.state_to_eps[key]), dtype=object)
-            other_eps_data = self.np_random.choice(other_eps_data, self.batch_size-1)
+        mean_R = mean_R/self.batch_size
+        for _ in range(self.batch_size):
+            mean_Rs.append(mean_R)       
 
-            for e in other_eps_data:
-                t_: Transition = self.ep_to_transitions[e.id][e.idx]
-                batch_states.append(t_.observation)
-                batch_actions.append(t_.action)
-                batch_rewards.append(np.float32(t_.reward))
-                batch_next_states.append(t_.next_observation)
-                batch_returns.append(np.float32(t_.observed_return))
-                mean_R += np.float32(t_.return_)/self.batch_size
-                batch_horizons.append(np.float32(t_.horizon))
-                batch_probs.append(t.prob)
-                mean_h += t_.horizon / self.batch_size
-
-            for _ in range(self.batch_size):
-                batch_mean_Rs.append(mean_R)
-            states.append(batch_states)
-            actions.append(batch_actions)
-            rewards.append(batch_rewards)
-            next_states.append(batch_next_states)
-            returns.append(batch_returns)
-            mean_Rs.append(batch_mean_Rs)
-            horizons.append(batch_horizons)
-            probs.append(batch_probs)
-
-        return states, actions, rewards, next_states, returns, mean_Rs, horizons, probs
+        return states, actions, rewards, next_states, returns, mc_returns, mean_Rs, horizons, probs, is_init
 
     
 
@@ -650,86 +617,72 @@ class MO_AWR(MOAgent, MOPolicy):
         actions = []
         rewards = []
         next_states = []
-        returns = [] # observed returns (MC return)
-        mean_Rs = [] # batch means over TD(lambda)-return
+        returns = [] # TD returns
+        mc_returns = []
+        mean_Rs = [] # batch means over immediate rewards
         horizons = []
         probs = []
+        is_init = []
+
         expected_Rs = []
 
         max_steps = max(self.num_policy_steps, self.num_value_steps, self.num_popf_steps)
         current_steps = 0
         while current_steps < max_steps:
-            s, a, r, s_, R, mean_R, h, p = self.get_batched_trajectory()
+            s, a, r, s_, R, mc_R, mean_R, h, p, inits = self.get_batch()
 
             states.append(s)
             actions.append(a)
             rewards.append(r)
             next_states.append(s_)
             returns.append(R)
+            mc_returns.append(mc_R)
             mean_Rs.append(mean_R)
             horizons.append(h)
             probs.append(p)
-            current_steps += len(s)
+            is_init.append(inits)
+            current_steps += 1
 
         val_losses = []
-        val_steps = 0
-        while val_steps < self.num_value_steps:
-            #iterate over batched trajectories
-            for e in range(len(states)):
-                # iterate over single trajectory
-                for i in range(len(states[e])):
-                    s, R, mean_R, h = states[e][i], returns[e][i], mean_Rs[e][i], horizons[e][i]
-                    val_loss, _ = self.update_value_function(s, mean_R, R, h)
-                    val_losses.append(val_loss.detach().cpu().numpy())
-                val_steps += len(states[e])
-        self.global_step += val_steps
+        for e in range(self.num_value_steps):
+            s, R, mean_R, r, h = states[e], mc_returns[e], mean_Rs[e], rewards[e], horizons[e]
+            val_loss, _ = self.update_value_function(s, mean_R, R, r, h)
+            val_losses.append(val_loss.detach().cpu().numpy())
+        self.global_step += self.num_value_steps
 
         # compute expected returns using value function
         # also add these returns to the PF if possible.
         pf_candidates = []
-        for e in range(len(returns)):
-            batch_E_Rs = []
-            for i in range(len(returns[e])):
-                E_Rs = self.value_net(th.FloatTensor(np.array(states[e][i])).to(self.device),
-                                              th.FloatTensor(np.array(returns[e][i])).to(self.device),
-                                              th.FloatTensor(np.array(horizons[e][i])).unsqueeze(1).to(self.device)).detach().cpu().numpy()
-                batch_E_Rs.append(E_Rs)
-                if i == 0:
-                    for idx in range(E_Rs.shape[0]):
-                        pf_candidates.append((E_Rs[idx], horizons[e][0][idx]))
-            expected_Rs.append(batch_E_Rs)
+        for e in range(len(mc_returns)):
+            E_Rs = self.value_net(th.FloatTensor(np.array(states[e])).to(self.device),
+                                            th.FloatTensor(np.array(mc_returns[e])).to(self.device),
+                                            th.FloatTensor(np.array(horizons[e])).unsqueeze(1).to(self.device)).detach().cpu().numpy()
+            # add expected return to PF
+            for i in range(self.batch_size):
+                if is_init[e][i] == 1:
+                    pf_candidates.append((E_Rs[i], horizons[e][i]))
+            expected_Rs.append(E_Rs)
         self._add_to_pf(pf_candidates)
 
         policy_losses = []
-        policy_steps = 0
-        while policy_steps < self.num_policy_steps:
-            for e in range(len(states)):
-                for i in range(len(states[e])):
-                    s, a, R, h, E_Rs, p = states[e][i], actions[e][i], returns[e][i], horizons[e][i], expected_Rs[e][i], probs[e][i]
-                    policy_loss, _ = self.update_policy(s, a, R, h, E_Rs, p)
-                    policy_losses.append(policy_loss.detach().cpu().numpy())
-                policy_steps += len(states[e])
-        self.global_step += policy_steps
+        for e in range(self.num_policy_steps):
+            s, a, R, h, E_Rs, p = states[e], actions[e], returns[e], horizons[e], expected_Rs[e], probs[e]
+            policy_loss, _ = self.update_policy(s, a, R, h, E_Rs, p)
+            policy_losses.append(policy_loss.detach().cpu().numpy())
+        self.global_step += self.num_policy_steps
 
         popf_losses = []
         if self.use_popf:
-            popf_steps = 0
-            while popf_steps < self.num_popf_steps:
-                for e in range(len(states)):
-                    prev = expected_Rs[e][0]
-                    # start counting from idx 1
-                    # POPF is only used for predicting value vectors after the first transition!
-                    for i in range(1, len(states[e])):
-                        s, a, r, s_, next_R = states[e][i], actions[e][i], rewards[e][i], next_states[e][i], expected_Rs[e][i]
-                        N = (prev - np.array(r)) / self.gamma
-                        popf_loss, _ = self.update_popf(N, s, a, s_, next_R)
-                        popf_losses.append(popf_loss.detach().cpu().numpy())
-                        prev = next_R
-                    popf_steps += len(states[e])
-
-            self.global_step += popf_steps
-
-        
+            for e in range(self.num_popf_steps):
+                prev = expected_Rs[e]
+                s, a, r, s_ = states[e], actions[e], rewards[e], next_states[e]
+                N = (prev - np.array(r)) / self.gamma
+                next_R = self.value_net(th.FloatTensor(np.array(next_states[e])).to(self.device),
+                                            th.FloatTensor(np.array(mc_returns[e])).to(self.device),
+                                            th.FloatTensor(np.array(horizons[e]) - 1).unsqueeze(1).to(self.device)).detach().cpu().numpy()
+                popf_loss, _ = self.update_popf(N, s, a, s_, next_R)
+                popf_losses.append(popf_loss.detach().cpu().numpy())
+            self.global_step += self.num_popf_steps
 
         return val_losses, popf_losses, policy_losses
 
@@ -807,7 +760,7 @@ class MO_AWR(MOAgent, MOPolicy):
             np.set_printoptions(precision=3)
             print(f"Pareto Front: \n {np.array(self.pf_points, dtype=object)}")
 
-            desired_return, desired_horizon = self._choose_commands(num_pf_points)
+            desired_return, desired_horizon = self._choose_commands()
             expl_returns = []
             for _ in range(num_expl_episodes):
                 transitions = self._run_episode(desired_return, desired_horizon)
@@ -818,11 +771,12 @@ class MO_AWR(MOAgent, MOPolicy):
             self._update_er_distances()
 
             # prune non-achievable returns from PF
+            eval_pf = []
             if iteration >= (evals + 1) * prune_pf_every:
                 evals += 1
                 print("Pruning PF")
-                eval_returns = self.evaluate_pf(num_eval_iter)
-                self.prune_pf(eval_returns, pf_prune_threshold)
+                eval_pf = self.evaluate_pf(num_eval_iter)
+                eval_pf = self.prune_pf(eval_pf, pf_prune_threshold)
             
             if not self.use_popf:
                 popf_losses = [0]
@@ -849,8 +803,10 @@ class MO_AWR(MOAgent, MOPolicy):
                     er_returns = [r[2][0].return_ for r in self.experience_replay]
                     x1, y1 = zip(*er_returns)
                     pf = [p[0] for p in self.pf_points]
-                    eval_returns = self.evaluate_pf(num_eval_iter)
-                    eval_returns = [p[0] for p in eval_returns]
+                    if len(eval_pf) == 0:
+                        # avoid repeating expensive env steps
+                        eval_pf = self.evaluate_pf(num_eval_iter)
+                    eval_returns = [p[0] for p in eval_pf]
 
                     # write PF points to csv file
                     csv_file = data_dir + 'points_' + str(n_checkpoints) + '.csv'
@@ -858,15 +814,19 @@ class MO_AWR(MOAgent, MOPolicy):
                         "x1",
                         "y1",
                         #"z1",
+                        "h1",
                         "x2",
                         "y2",
-                        #"z2"
+                        #"z2",
+                        "h2"
                     ]
-                    with open(csv_file, 'x', newline='') as p:
+                    with open(csv_file, 'w', newline='') as p:
                         writer = csv.writer(p)
                         writer.writerow(header)
-                        for pf_points, eval_points in zip(pf, eval_returns):
-                            row = list(pf_points) + list(eval_points)
+                        for pf_points, eval_points in zip(self.pf_points, eval_pf):
+                            ret1, h1 = pf_points
+                            ret2, h2 = eval_points
+                            row = list(ret1) + [h1] + list(ret2) + [h2]
                             writer.writerow(row)
 
                     if plot_results:
