@@ -209,11 +209,11 @@ class MO_AWR(MOAgent, MOPolicy):
         self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr)
         self.val_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.val_opt, 50000, 1e-5)
         self.policy_opt = th.optim.Adam(self.policy.parameters(), lr=self.policy_lr)
-        self.policy_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.policy_opt, 50000, 1e-5)
+        #self.policy_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.policy_opt, 50000, 1e-5)
         if use_popf:
             self.popf = PopNet(self.reward_dim + 1 + self.observation_dim*2, self.reward_dim)
             self.popf_opt = th.optim.Adam(self.popf.parameters(), lr=self.popf_lr)
-            self.popf_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.popf_opt, 50000, 1e-5)
+            self.popf_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.popf_opt, 50000, 7e-5)
 
         self.log = log
         if log:
@@ -243,9 +243,9 @@ class MO_AWR(MOAgent, MOPolicy):
             transitions[i].observed_return += self.gamma * transitions[i + 1].observed_return
             if (not fill_buffer) and self.td_lambda < 1:
                 transitions[i].return_ = transitions[i].reward + self.gamma * ((1-self.td_lambda) *
-                                                                               self.value_net(th.FloatTensor(transitions[i].observation).unsqueeze(0).to(self.device),
-                                                                                              th.FloatTensor(transitions[i].observed_return).unsqueeze(0).to(self.device),
-                                                                                              th.FloatTensor((np.array(transitions[i].horizon) - 1).reshape(1,1)).to(self.device)).detach().numpy()[0] +
+                                                                               self.value_net(th.FloatTensor(transitions[i+1].observation).unsqueeze(0).to(self.device),
+                                                                                              th.FloatTensor(transitions[i+1].observed_return).unsqueeze(0).to(self.device),
+                                                                                              th.FloatTensor((np.array(transitions[i+1].horizon)).reshape(1,1)).to(self.device)).detach().numpy()[0] +
                                                                                self.td_lambda*transitions[i + 1].return_)
             else:
                 transitions[i].return_ += self.gamma * transitions[i + 1].return_
@@ -374,31 +374,19 @@ class MO_AWR(MOAgent, MOPolicy):
 
         return np.float32(c[0]), np.float32(desired_horizon)
 
-    def compute_value_loss(self, preds, returns, mean_rs):
-        """
-        Idea:
-            - Compute SE between targets and mean_rs
-            - Compute squared error between each pred and target
-            - Weight each error term using 1/(MSE(targets, mean_rs)+1). This will push the value estimates towards the desired returns while keeping sample-efficiency
-            - The loss behaves like MSBE for returns ~= desired return
-        """
-        weights = 1/(th.sum((returns - mean_rs)**2, dim=1) + 1)
-        errors = th.sum((preds - mean_rs)**2, dim=1)
-        return th.mean(errors*weights)
-
     def update_value_function(self, states, mean_rs, returns, rewards, horizons):
         mean_rs = np.array(mean_rs)
         states = th.FloatTensor(np.array(states)).to(self.device)
         returns = np.array(returns)
         horizons = th.FloatTensor(np.array(horizons)).unsqueeze(1).to(self.device)
+        rewards = np.array(rewards)
 
         self.value_net.train()
         self.val_opt.zero_grad()
         preds = self.value_net(states, th.FloatTensor(returns).to(self.device), horizons)
 
         # subtract observed reward and add mean reward
-        targets =  th.FloatTensor(returns - np.array(rewards) + mean_rs)
-        #loss = self.compute_value_loss(preds, returns, mean_rs)
+        targets =  th.FloatTensor(returns - rewards + mean_rs)
         loss = F.mse_loss(preds, targets)
         loss.backward()
         self.val_opt.step()
@@ -467,7 +455,7 @@ class MO_AWR(MOAgent, MOPolicy):
         loss = self.compute_policy_loss(preds, actions, returns, expected_returns, probs)
         loss.backward()
         self.policy_opt.step()
-        self.policy_sched.step()
+        #self.policy_sched.step()
         return loss, preds
 
     def _act(self, state, desired_return, desired_horizon, eval_mode=False):

@@ -77,4 +77,4 @@ class RandomMOMDP(gymnasium.Env):
         self._timestep += 1
 
         # Return the current state, a reward and whether the episode terminates
-        return self._state, rewards, self._timestep == 50, False, {}
+        return self._state, rewards, self._timestep == 25, False, {}
