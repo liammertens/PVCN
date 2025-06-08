@@ -64,16 +64,16 @@ class RandomMOMDP(gymnasium.Env):
         """ Reset the environment and return the initial state number
         """
         super().reset(seed=seed)
-        self._state = np.int64(0)
+        self._state = np.int64([0])
         self._timestep = 0
 
         return self._state, {}
 
     def step(self, action):
         # Change state using the transition function
-        next_state = np.int64(np.random.choice(self._nstates, p=self._transition_function[self._state, action]))
-        rewards = self._reward_function[self._state, action, next_state]
-        self._state = next_state
+        next_state = np.int64(np.random.choice(self._nstates, p=self._transition_function[self._state[0], action]))
+        rewards = self._reward_function[self._state[0], action, next_state]
+        self._state = np.int64([next_state])
         self._timestep += 1
 
         # Return the current state, a reward and whether the episode terminates

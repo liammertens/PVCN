@@ -76,8 +76,9 @@ def crowding_distance(points):
 
 class ValueNet(nn.Module):
     """Value network V(s, R') (critic)"""
-    def __init__(self, state_dim: int, reward_dim: int, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, reward_dim: int, scaling_factor, hidden_dim: int = 64):
         super().__init__()
+        self.scaling_factor = scaling_factor
         self.state_emb = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LeakyReLU(),
@@ -93,7 +94,7 @@ class ValueNet(nn.Module):
         )
     def forward(self, state, desired_return, horizon):
         s = self.state_emb(state)
-        c = th.cat((desired_return, horizon), dim=1)
+        c = th.cat((desired_return, horizon), dim=1) * self.scaling_factor
         r = self.c_emb(c)
         pred = self.fc(s*r)
         return pred
@@ -103,8 +104,9 @@ class PolicyNet(nn.Module):
     Policy network pi(a|s, R') (actor):
         Only supports discrete actions
     """
-    def __init__(self, state_dim: int, reward_dim: int, action_dim: int, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, reward_dim: int, action_dim: int, scaling_factor, hidden_dim: int = 64):
         super().__init__()
+        self.scaling_factor = scaling_factor
         self.state_emb = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LeakyReLU(),
@@ -121,7 +123,7 @@ class PolicyNet(nn.Module):
         )
     def forward(self, state, desired_return, horizon):
         s = self.state_emb(state.float())
-        c = th.cat((desired_return, horizon), dim=1)
+        c = th.cat((desired_return, horizon), dim=1) * self.scaling_factor
         r = self.c_emb(c)
         pred = self.fc(s*r)
         return pred
@@ -148,6 +150,7 @@ class MO_AWR(MOAgent, MOPolicy):
     def __init__(
             self,
             env: gym.Env,
+            scaling_factor: np.ndarray,
             policy_lr: float = 1e-4,
             value_lr: float = 1e-4,
             popf_lr: float = 1e-4,
@@ -158,7 +161,7 @@ class MO_AWR(MOAgent, MOPolicy):
             batch_size: int = 4,
             max_buffer_size: int = 1024,
             use_popf: bool = True,
-            use_is_weighting=True,
+            use_is_weighting=False,
             min_exploration_stdev = 0,
             device: Union[th.device, str] = "auto",
             log: bool = False,
@@ -169,6 +172,7 @@ class MO_AWR(MOAgent, MOPolicy):
         """
         Args:
             env: Gym environment.
+            scaling_factor: scaling factor for return and horizon conditioning
             learning_rate: Learning rate
             gamma: Discount factor
             td_lambda: Lambda parameter for TD update
@@ -198,13 +202,14 @@ class MO_AWR(MOAgent, MOPolicy):
         self.min_expl_stdev = min_exploration_stdev
         self.beta = beta
         self.alpha = alpha
+        self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
 
         self.pf_points = [] # tuples (return, horizon)
 
         # initialize networks
         th.autograd.set_detect_anomaly(True, )
-        self.value_net = ValueNet(self.observation_dim, self.reward_dim)
-        self.policy = PolicyNet(self.observation_dim, self.reward_dim, self.action_dim)
+        self.value_net = ValueNet(self.observation_dim, self.reward_dim, self.scaling_factor)
+        self.policy = PolicyNet(self.observation_dim, self.reward_dim, self.action_dim, self.scaling_factor)
 
         self.val_opt = th.optim.Adam(self.value_net.parameters(), lr=self.value_lr)
         self.val_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.val_opt, 50000, 1e-5)
@@ -386,6 +391,7 @@ class MO_AWR(MOAgent, MOPolicy):
         preds = self.value_net(states, th.FloatTensor(returns).to(self.device), horizons)
 
         # subtract observed reward and add mean reward
+        # This should propagate forward by bootstrapping such that the value function converges to expected value
         targets =  th.FloatTensor(returns - rewards + mean_rs)
         loss = F.mse_loss(preds, targets)
         loss.backward()
@@ -427,9 +433,10 @@ class MO_AWR(MOAgent, MOPolicy):
             if dominates:
                 A = np.linalg.norm(returns[i]-V_s[i])
             else:
+                #A = 0
                 A = -np.linalg.norm(returns[i]-V_s[i])
             weights.append(A)
-        weights = np.array(weights)
+        weights = np.array(weights) / self.beta
         # normalize weights
         weights = (weights - weights.mean()) / (weights.std() + 1e-8)
         return th.tensor(weights)
@@ -444,7 +451,7 @@ class MO_AWR(MOAgent, MOPolicy):
           is_ratios = th.ones(self.batch_size)
         advantages = self.compute_advantages(returns, expected_returns)
         entropy = -th.sum(preds * th.log(preds + 1e-8), dim=1).mean()
-        loss = -th.mean(th.log(preds[th.arange(self.batch_size), actions] + 1e-8)*is_ratios*th.exp(advantages/self.beta)) - self.alpha*entropy
+        loss = -th.mean(th.log(preds[th.arange(self.batch_size), actions] + 1e-8)*is_ratios*th.exp(advantages)) - self.alpha*entropy
         return loss
     def update_policy(self, states, actions, returns, horizons, expected_returns, probs):
         states = th.FloatTensor(np.array(states)).to(self.device)
@@ -469,7 +476,7 @@ class MO_AWR(MOAgent, MOPolicy):
         if eval_mode:
             action = np.argmax(probs)
         else:
-            action = self.np_random.choice(np.arange(len(probs)), p=probs) # exponentiate to get proper prob.
+            action = self.np_random.choice(np.arange(len(probs)), p=probs)
         return action, probs[action]
 
     def _run_episode(self, desired_return, desired_horizon, eval_mode=False):

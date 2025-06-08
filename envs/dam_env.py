@@ -15,23 +15,23 @@ class Dam(gymnasium.Env):
     def __init__(self, seed=None, s_0=None, penalize=True):
         self.rng = np.random.default_rng(seed)
 
-        self.capacity = 10 # Max capacity of reservoir
-        self.demand = 4 # Water demand
-        """self.power_demand = 3
-        self.flood_threshold = 4"""
+        self.capacity = 10
+        self.water_demand = 4
+        self.power_demand = 3
         # inflow distribution
-        self.inflow_mean = 2.0
-        self.inflow_std = .5
+        self.inflow_mean = 2
+        self.inflow_std = 1
         self.penalize=penalize
 
         # NOTE: this assumes that the max water release over a single timestep is the reservoir capacity (which is more than IRL)
         self.action_space = spaces.Discrete(self.capacity)
 
-        self.observation_space = spaces.Box(
+        """self.observation_space = spaces.Box(
             low=0,
             high=np.inf,
             dtype=np.int64
-        )
+        )"""
+        self.observation_space = spaces.Discrete(150)
         self.reward_space = spaces.Box(
           low=np.array([-np.inf, -np.inf]),
           high=np.zeros(2),
@@ -66,25 +66,23 @@ class Dam(gymnasium.Env):
         inflow = int(round(self.rng.normal(self.inflow_mean, self.inflow_std)))
         n_state = np.clip(self.state - action + inflow, 0, None).astype(np.int64)
 
-        # Flooding objective
+        """# Flooding objective
         overflow = np.clip(n_state - self.capacity, 0, None)[0]
-        r0 = -overflow + penalty
+        r0 = -overflow + penalty"""
 
         # Deficit in water supply w.r.t. demand
-        supply_error = -np.clip(self.demand - action, 0, None)[0]
+        supply_error = np.clip(n_state - self.water_demand, None, 0)[0]
         r1 = supply_error + penalty
 
-        reward = np.array([r0, r1], dtype=np.float32).flatten()
-
-        """# deficit in hydro-electric power supply
+        # deficit in hydro-electric power supply
         deficit = np.clip(self.power_demand - action, 0, None)[0]
         r2 = -deficit + penalty
 
-        # Flood risk downstream
+        """# Flood risk downstream
         flood_risk = np.clip(action - self.flood_threshold, 0, None)[0]
         r3 = -flood_risk + penalty"""
 
-        reward = np.array([r0, r1], dtype=np.float32).flatten()
+        reward = np.array([r1, r2], dtype=np.float32).flatten()
 
         self.state = n_state
 
