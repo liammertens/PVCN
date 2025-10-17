@@ -125,15 +125,14 @@ class PVCN(MOAgent, MOPolicy):
     def __init__(
             self,
             env: gym.Env,
-            scaling_factor: np.ndarray,
-            policy_lr: float = 1e-4,
-            popf_lr: float = 1e-4,
+            scaling_factor,
+            policy_lr: float = 1e-3,
+            popf_lr: float = 1e-3,
             gamma: float = 1,
-            alpha = .01,
-            batch_size: int = 4,
-            max_buffer_size: int = 1024,
+            alpha = .1,
+            batch_size: int = 32,
+            max_buffer_size: int = 512,
             use_popf: bool = True,
-            min_exploration_stdev = 0,
             device: Union[th.device, str] = "auto",
             log: bool = False,
             wandb_entity: Optional[str] = None,
@@ -143,14 +142,11 @@ class PVCN(MOAgent, MOPolicy):
         """
         Args:
             env: Gym environment.
-            scaling_factor: scaling factor for return and horizon conditioning
             learning_rate: Learning rate
             gamma: Discount factor
-            cd_threshold: Determines min. crowding distance for using simple L2-distance
             batch_size: Maximum batch size for learning.
             max_buffer_size: Maximum size of ER buffer (= amount of trajectories)
             use_popf: Whether to use POPF network
-            min_explorations_stdev: stdev to use when only a single return is in the PF.
         """
         MOAgent.__init__(self, env, device=device, seed=seed)
         MOPolicy.__init__(self, device)
@@ -165,19 +161,19 @@ class PVCN(MOAgent, MOPolicy):
         self.batch_size = batch_size
         self.max_buffer_size = max_buffer_size
         self.use_popf = use_popf
-        self.min_expl_stdev = min_exploration_stdev
         self.alpha = alpha
         self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
 
         self.pf_points = [] # tuples (return, horizon)
+        self.relaxed_pf_points = [] # backup PF
 
         # initialize networks
         th.autograd.set_detect_anomaly(True, )
-        self.policy = PolicyNet(self.observation_shape[0], self.reward_dim, self.action_dim, self.scaling_factor)
+        self.policy = PolicyNet(self.observation_shape[0], self.reward_dim, self.action_dim, self.scaling_factor).to(self.device)
 
         self.policy_opt = th.optim.Adam(self.policy.parameters(), lr=self.policy_lr)
         if use_popf:
-            self.popf = PopNet(self.reward_dim + 1 + self.observation_shape[0]*2, self.reward_dim)
+            self.popf = PopNet(self.reward_dim + 1 + self.observation_shape[0]*2, self.reward_dim).to(self.device)
             self.popf_opt = th.optim.Adam(self.popf.parameters(), lr=self.popf_lr)
             self.popf_sched = th.optim.lr_scheduler.CosineAnnealingLR(self.popf_opt, 50000, 7e-5)
 
@@ -195,10 +191,8 @@ class PVCN(MOAgent, MOPolicy):
             "buffer_size": self.max_buffer_size,
             "use_popf": self.use_popf,
             "seed": self.seed,
-            "use_IS_weights": self.use_is_weighting,
         }
 
-    # code from https://github.com/LucasAlegre/morl-baselines/blob/main/morl_baselines/multi_policy/pcn/pcn.py
     def _add_episode(self, transitions: List[Transition], max_size: int, step: int) -> None:
         # compute return and add to dictionaries
         for i in reversed(range(len(transitions) - 1)):
@@ -244,7 +238,7 @@ class PVCN(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
-    def _update_er_distances(self, threshold=.2, keep_duplicates=False):
+    def _update_er_distances(self, threshold=.2):
         """See Section 4.4 of https://arxiv.org/pdf/2204.05036.pdf for details."""
         returns = np.array([e[2][0].return_ for e in self.experience_replay])
         # crowding distance of each point, check ones that are too close together
@@ -260,19 +254,14 @@ class PVCN(MOAgent, MOPolicy):
         l2 = np.min(np.linalg.norm(returns_exp - non_dominated, axis=-1), axis=-1) * -1
         # all points that are too close together (crowding distance < threshold) get a penalty
         non_dominated_i = np.nonzero(non_dominated_i)[0]
-        if not keep_duplicates:
-            _, unique_i = np.unique(non_dominated, axis=0, return_index=True)
-            unique_i = non_dominated_i[unique_i]
-            duplicates = np.ones(len(l2), dtype=bool)
-            duplicates[unique_i] = False
-            l2[duplicates] -= 1e-5
         l2[sma] *= 2
         # update all distances in heap
         for i in range(len(l2)):
             self.experience_replay[i] = (l2[i], self.experience_replay[i][1], self.experience_replay[i][2])
         heapq.heapify(self.experience_replay)
 
-    def _add_to_pf(self, returns, keep_oldest=False):
+    # TODO: consider adding a secondary PF. This could potentially help in exploration
+    def _add_to_pf(self, returns):
         """
         Adds a set of points to the PF:
             1. Keep non dominated points
@@ -289,36 +278,37 @@ class PVCN(MOAgent, MOPolicy):
         # avoid unncessary computations + shape mismatch when computing CD for single point
         if self.pf_points.shape[0] > 1:
           distances = crowding_distance(np.array([nd[0] for nd in self.pf_points], dtype=object))
-          sorted_inds = np.argsort(distances) # NOTE: stable arg not supported in this np version...
+          sorted_inds = np.argsort(distances)
           # only keep best num_pf_points
           sorted_inds = sorted_inds[-self.num_pf_points:]
           self.pf_points = self.pf_points[sorted_inds].tolist()
         else:
           self.pf_points = self.pf_points.tolist()
 
-    def _choose_commands(self):
-        """
-        Pick a desired return from the PF and increase it in one objective based on the mean/stdev of the PF returns.
+    """
+        Pick a desired return from the PF and increase it in one objective based on the stdev of the PF returns.
         If only a single return is present, use a user-defined stdev
-        """
+    """
+    """def _choose_commands(self):
         # pick random objective
         r_i = self.np_random.integers(0, self.reward_dim)
-        # pick random returns
-        ret_idx = self.np_random.integers(0, len(self.pf_points))
         stdev = np.std(np.array([p[0] for p in self.pf_points]), axis=0)[r_i]
+        # pick random return
+        ret_idx = self.np_random.integers(0, len(self.pf_points))
         desired_return = np.array(self.pf_points[ret_idx], dtype=object)
         # make a deep copy as we are working with np array of objects!
         c = copy.deepcopy(desired_return)
-        # ensure some exploration is still done when only one sample is in PF
-        if self.min_expl_stdev != 0 and stdev < self.min_expl_stdev:
-            stdev = self.min_expl_stdev
         c[0][r_i] += self.np_random.uniform(0, stdev)
         desired_horizon = c[1]
         # decrease horizon in attempt to improve
-        # do not limit to be positive so that model learns this
+        # do not limit to be positive so that model learns this is impossible
         desired_horizon -= 2
-
-        return np.float32(c[0]), np.float32(desired_horizon)
+        return np.float32(c[0]), np.float32(desired_horizon)"""
+    
+    def _choose_commands(self):
+        ret_idx = self.np_random.integers(0, len(self.pf_points))
+        desired_return = np.array(self.pf_points[ret_idx], dtype=object)
+        return np.float32(desired_return[0]), np.float32(desired_return[1])
 
     def update_popf(self, N, states, actions, next_states, next_Rs):
         states = th.FloatTensor(states)
@@ -326,7 +316,7 @@ class PVCN(MOAgent, MOPolicy):
         next_states = th.FloatTensor(next_states)
         N = th.FloatTensor(N)
         x = th.cat((N, states, actions, next_states), dim=1).float().to(self.device)
-        targets = th.FloatTensor(next_Rs)
+        targets = th.FloatTensor(next_Rs).to(self.device)
         self.popf.train()
         self.popf_opt.zero_grad()
 
@@ -348,9 +338,10 @@ class PVCN(MOAgent, MOPolicy):
     def update_policy(self, states, actions, horizons, expected_returns):
         states = th.FloatTensor(states).to(self.device)
         horizons = th.FloatTensor(horizons).unsqueeze(1).to(self.device)
+        expected_returns = th.FloatTensor(expected_returns).to(self.device)
 
         self.policy_opt.zero_grad()
-        preds = self.policy(states, th.FloatTensor(expected_returns).to(self.device), horizons)
+        preds = self.policy(states, expected_returns, horizons)
         loss = self.compute_policy_loss(preds, actions)
         loss.backward()
         self.policy_opt.step()
@@ -389,7 +380,7 @@ class PVCN(MOAgent, MOPolicy):
                 x = np.concatenate((N, obs, [action], n_obs))
                 desired_return = self.popf(
                     th.tensor(x).float().to(self.device)
-                ).detach().numpy()
+                ).detach().cpu().numpy()
                 obs = n_obs
             else:
                 obs = n_obs
